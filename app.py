@@ -8,84 +8,84 @@ from io import StringIO
 
 app = Flask(__name__)
 
-# Load environment variables
+# --- Environment variables (set these in Render) ---
 ACCOUNT_SID = os.environ.get("ACCOUNT_SID")
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN")
-FROM_NUMBER = os.environ.get("FROM_NUMBER")  
-STUDIO_FLOW_SID = os.environ.get("STUDIO_FLOW_SID")  # Your Twilio Studio Flow SID
-BASE_URL = os.environ.get("PUBLIC_BASE_URL")  
+FROM_NUMBER = os.environ.get("FROM_NUMBER")                # e.g., +19025551234
+STUDIO_FLOW_SID = os.environ.get("STUDIO_FLOW_SID")        # e.g., FWxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+BASE_URL = os.environ.get("PUBLIC_BASE_URL")               # e.g., https://ivr-mini-script.onrender.com or your custom domain
+STATUS_CALLBACK_URL = os.environ.get("STATUS_CALLBACK_URL")# e.g., https://script.google.com/macros/s/.../exec
 
 client = Client(ACCOUNT_SID, AUTH_TOKEN)
 
-# ✅ 1. Start Calls from CSV
+# 1) Launch outbound calls from a CSV URL
 @app.route('/start-calls', methods=['POST'])
 def start_calls():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     csv_url = data.get("csv_url")
-
     if not csv_url:
         return jsonify({"error": "csv_url is required"}), 400
 
     try:
-        response = requests.get(csv_url)
-        csv_file = StringIO(response.text)
-        reader = csv.DictReader(csv_file)
+        resp = requests.get(csv_url)
+        resp.raise_for_status()
+        reader = csv.DictReader(StringIO(resp.text))
 
         results = []
         for row in reader:
-            to_number = row.get('phone_number')
+            to_number = (row.get('phone_number') or "").strip()
             if not to_number:
                 continue
 
             call = client.calls.create(
                 to=to_number,
                 from_=FROM_NUMBER,
-                url=f'{BASE_URL}/initial-twiml',
+                url=f'{BASE_URL}/initial-twiml',             # park silently while AMD runs
                 machine_detection='DetectMessageEnd',
                 async_amd=True,
-                async_amd_status_callback=f'{BASE_URL}/amd-handler'
+                async_amd_status_callback=f'{BASE_URL}/amd-handler',
+                # Log call outcomes directly to Google Apps Script (no server load)
+                status_callback=STATUS_CALLBACK_URL,
+                status_callback_method='POST',
+                status_callback_event=['completed']          # add 'initiated','ringing','answered' if you want more telemetry
             )
 
-            results.append({
-                "to": to_number,
-                "sid": call.sid
-            })
+            results.append({"to": to_number, "sid": call.sid})
 
         return jsonify({"calls_started": results})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ✅ 2. Provide a Silent TwiML Response while AMD runs
+
+# 2) Silent parking TwiML while AMD runs (prevents leaking audio into greetings)
 @app.route('/initial-twiml', methods=['GET', 'POST'])
 def initial_twiml():
-    response = VoiceResponse()
-    response.pause(length=60)
-    return str(response), 200, {'Content-Type': 'text/xml'}
+    vr = VoiceResponse()
+    vr.pause(length=60)  # plenty of time for DetectMessageEnd
+    return str(vr), 200, {'Content-Type': 'text/xml'}
 
-# ✅ 3. Handle AMD Callback from Twilio
+
+# 3) AMD callback: hang up on machines; redirect humans into Studio Flow
 @app.route('/amd-handler', methods=['POST'])
 def amd_handler():
-    answered_by = request.form.get('AnsweredBy')
+    answered_by = request.form.get('AnsweredBy')  # 'human', 'machine_start', 'machine_end_beep', etc.
     call_sid = request.form.get('CallSid')
-    to_number = request.form.get('To')
 
-    print(f"[AMD] Call SID: {call_sid}, To: {to_number}, Answered By: {answered_by}")
-
-    response = VoiceResponse()
-
-    if answered_by in ['machine_start', 'machine_end_beep']:
-        print("→ Voicemail detected. Hanging up.")
-        response.hangup()
+    vr = VoiceResponse()
+    if answered_by in ('machine_start', 'machine_end_beep'):
+        # Voicemail detected → hang up (no message left)
+        vr.hangup()
     else:
-        print("→ Human detected. Redirecting to Studio Flow.")
-        response.redirect(
-            f'https://webhooks.twilio.com/v1/Accounts/{ACCOUNT_SID}/Flows/{STUDIO_FLOW_SID}?FlowEvent=trigger'
+        # Human detected → redirect to Studio Flow; pass orig_call_sid for downstream logging
+        vr.redirect(
+            f'https://webhooks.twilio.com/v1/Accounts/{ACCOUNT_SID}/Flows/{STUDIO_FLOW_SID}'
+            f'?FlowEvent=trigger&orig_call_sid={call_sid}'
         )
+    return str(vr), 200, {'Content-Type': 'text/xml'}
 
-    return str(response), 200, {'Content-Type': 'text/xml'}
 
-# Optional health check route
+# Health check
 @app.route('/', methods=['GET'])
 def index():
     return "IVR caller app running", 200
